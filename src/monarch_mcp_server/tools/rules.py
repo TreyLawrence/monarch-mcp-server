@@ -11,6 +11,56 @@ from monarch_mcp_server.helpers import json_success, json_error
 
 logger = logging.getLogger(__name__)
 
+
+def _build_amount_criteria(
+    operator: Optional[str],
+    value: Optional[float],
+    value_range: Optional[List[float]],
+    is_expense: bool,
+) -> Optional[Dict[str, Any]]:
+    """Build an ``amountCriteria`` input, or None if underspecified.
+
+    ``between`` requires a ``[lower, upper]`` range (mapped to ``valueRange``);
+    every other operator (``eq``/``gt``/``lt``) uses a single ``value``.
+    """
+    if not operator:
+        return None
+    criteria: Dict[str, Any] = {
+        "operator": operator,
+        "isExpense": is_expense,
+        "value": None,
+        "valueRange": None,
+    }
+    if operator == "between":
+        if not value_range or len(value_range) != 2:
+            return None
+        criteria["valueRange"] = {"lower": value_range[0], "upper": value_range[1]}
+    else:
+        if value is None:
+            return None
+        criteria["value"] = value
+    return criteria
+
+
+def _build_statement_criteria(
+    operator: Optional[str],
+    value: Optional[str],
+    values: Optional[List[str]],
+) -> Optional[List[Dict[str, Any]]]:
+    """Build an ``originalStatementCriteria`` list (matches raw statement text).
+
+    Accepts a single value or a list; all share one operator (default
+    ``contains``). Returns None when no value is provided.
+    """
+    op = operator or "contains"
+    vals = [v for v in (values or []) if v]
+    if not vals and value:
+        vals = [value]
+    if not vals:
+        return None
+    return [{"operator": op, "value": v} for v in vals]
+
+
 # ---------------------------------------------------------------------------
 # GraphQL constants
 # ---------------------------------------------------------------------------
@@ -209,8 +259,12 @@ async def create_transaction_rule(
     merchant_criteria_operator: Optional[str] = None,
     merchant_criteria_value: Optional[str] = None,
     merchant_criteria_values: Optional[List[str]] = None,
+    original_statement_operator: Optional[str] = None,
+    original_statement_value: Optional[str] = None,
+    original_statement_values: Optional[List[str]] = None,
     amount_operator: Optional[str] = None,
     amount_value: Optional[float] = None,
+    amount_value_range: Optional[List[float]] = None,
     amount_is_expense: bool = True,
     set_category_id: Optional[str] = None,
     set_merchant_name: Optional[str] = None,
@@ -228,8 +282,18 @@ async def create_transaction_rule(
     Args:
         merchant_criteria_operator: How to match merchant ("eq", "contains")
         merchant_criteria_value: Merchant name/pattern to match
+        merchant_criteria_values: Match any of several merchant patterns
+        original_statement_operator: How to match the raw bank statement text
+            ("eq", "contains")
+        original_statement_value: Statement text to match. This is the best way
+            to disambiguate a subscription from a merchant's other spending —
+            e.g. match "UBER ONE" or "APPLE.COM/BILL" without touching regular
+            Uber rides or Apple device purchases.
+        original_statement_values: Match any of several statement patterns
         amount_operator: Amount comparison ("gt", "lt", "eq", "between")
-        amount_value: Amount threshold value
+        amount_value: Amount threshold for "gt"/"lt"/"eq"
+        amount_value_range: [lower, upper] pair, required when operator is
+            "between" (e.g. [9.0, 10.0] to match a ~$9.99 charge)
         amount_is_expense: Whether amount is expense (negative) or income
         set_category_id: Category ID to assign (use get_categories for IDs)
         set_merchant_name: Merchant name to set on matching transactions
@@ -243,10 +307,10 @@ async def create_transaction_rule(
         Result of rule creation.
 
     Example:
-        Create rule: "Amazon purchases → Shopping category"
+        Uber One subscription without touching rides:
         create_transaction_rule(
-            merchant_criteria_operator="contains",
-            merchant_criteria_value="amazon",
+            original_statement_operator="contains",
+            original_statement_value="UBER ONE",
             set_category_id="cat_123"
         )
     """
@@ -269,13 +333,19 @@ async def create_transaction_rule(
                 {"operator": _merchant_op, "value": v} for v in _merchant_values
             ]
 
-        if amount_operator and amount_value is not None:
-            rule_input["amountCriteria"] = {
-                "operator": amount_operator,
-                "isExpense": amount_is_expense,
-                "value": amount_value,
-                "valueRange": None,
-            }
+        statement_criteria = _build_statement_criteria(
+            original_statement_operator,
+            original_statement_value,
+            original_statement_values,
+        )
+        if statement_criteria:
+            rule_input["originalStatementCriteria"] = statement_criteria
+
+        amount_criteria = _build_amount_criteria(
+            amount_operator, amount_value, amount_value_range, amount_is_expense
+        )
+        if amount_criteria:
+            rule_input["amountCriteria"] = amount_criteria
 
         if account_ids:
             rule_input["accountIds"] = account_ids
@@ -312,8 +382,12 @@ async def update_transaction_rule(
     merchant_criteria_operator: Optional[str] = None,
     merchant_criteria_value: Optional[str] = None,
     merchant_criteria_values: Optional[List[str]] = None,
+    original_statement_operator: Optional[str] = None,
+    original_statement_value: Optional[str] = None,
+    original_statement_values: Optional[List[str]] = None,
     amount_operator: Optional[str] = None,
     amount_value: Optional[float] = None,
+    amount_value_range: Optional[List[float]] = None,
     amount_is_expense: bool = True,
     set_category_id: Optional[str] = None,
     set_merchant_name: Optional[str] = None,
@@ -330,8 +404,13 @@ async def update_transaction_rule(
         rule_id: The ID of the rule to update (use get_transaction_rules to find IDs)
         merchant_criteria_operator: How to match merchant ("eq", "contains")
         merchant_criteria_value: Merchant name/pattern to match
+        merchant_criteria_values: Match any of several merchant patterns
+        original_statement_operator: How to match raw statement text ("eq", "contains")
+        original_statement_value: Statement text to match (e.g. "UBER ONE")
+        original_statement_values: Match any of several statement patterns
         amount_operator: Amount comparison ("gt", "lt", "eq", "between")
-        amount_value: Amount threshold value
+        amount_value: Amount threshold for "gt"/"lt"/"eq"
+        amount_value_range: [lower, upper] pair, required when operator is "between"
         amount_is_expense: Whether amount is expense (negative) or income
         set_category_id: Category ID to assign
         set_merchant_name: Merchant name to set
@@ -364,13 +443,19 @@ async def update_transaction_rule(
                 {"operator": _merchant_op, "value": v} for v in _merchant_values
             ]
 
-        if amount_operator and amount_value is not None:
-            rule_input["amountCriteria"] = {
-                "operator": amount_operator,
-                "isExpense": amount_is_expense,
-                "value": amount_value,
-                "valueRange": None,
-            }
+        statement_criteria = _build_statement_criteria(
+            original_statement_operator,
+            original_statement_value,
+            original_statement_values,
+        )
+        if statement_criteria:
+            rule_input["originalStatementCriteria"] = statement_criteria
+
+        amount_criteria = _build_amount_criteria(
+            amount_operator, amount_value, amount_value_range, amount_is_expense
+        )
+        if amount_criteria:
+            rule_input["amountCriteria"] = amount_criteria
 
         if account_ids:
             rule_input["accountIds"] = account_ids

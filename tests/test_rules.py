@@ -140,6 +140,72 @@ class TestCreateTransactionRule:
         assert variables["input"]["amountCriteria"]["isExpense"] is True
 
     @patch('monarch_mcp_server.tools.rules.get_monarch_client')
+    async def test_create_rule_with_original_statement(self, mock_get_client):
+        """Statement matching disambiguates a subscription from other spend."""
+        mock_client = AsyncMock()
+        mock_client.gql_call.return_value = {
+            "createTransactionRuleV2": {"errors": None}
+        }
+        mock_get_client.return_value = mock_client
+
+        result = await create_transaction_rule(
+            original_statement_operator="contains",
+            original_statement_value="UBER ONE",
+            set_category_id="cat_sub",
+        )
+
+        data = json.loads(result)
+        assert data["success"] is True
+
+        criteria = mock_client.gql_call.call_args.kwargs["variables"]["input"][
+            "originalStatementCriteria"
+        ]
+        assert criteria == [{"operator": "contains", "value": "UBER ONE"}]
+
+    @patch('monarch_mcp_server.tools.rules.get_monarch_client')
+    async def test_create_rule_with_amount_between(self, mock_get_client):
+        """'between' uses valueRange with lower/upper bounds."""
+        mock_client = AsyncMock()
+        mock_client.gql_call.return_value = {
+            "createTransactionRuleV2": {"errors": None}
+        }
+        mock_get_client.return_value = mock_client
+
+        result = await create_transaction_rule(
+            merchant_criteria_value="uber",
+            amount_operator="between",
+            amount_value_range=[9.0, 10.0],
+            set_category_id="cat_sub",
+        )
+
+        data = json.loads(result)
+        assert data["success"] is True
+
+        amt = mock_client.gql_call.call_args.kwargs["variables"]["input"]["amountCriteria"]
+        assert amt["operator"] == "between"
+        assert amt["value"] is None
+        assert amt["valueRange"] == {"lower": 9.0, "upper": 10.0}
+
+    @patch('monarch_mcp_server.tools.rules.get_monarch_client')
+    async def test_create_rule_between_without_range_is_omitted(self, mock_get_client):
+        """'between' without a range must not emit a malformed amountCriteria."""
+        mock_client = AsyncMock()
+        mock_client.gql_call.return_value = {
+            "createTransactionRuleV2": {"errors": None}
+        }
+        mock_get_client.return_value = mock_client
+
+        result = await create_transaction_rule(
+            merchant_criteria_value="uber",
+            amount_operator="between",
+            set_category_id="cat_sub",
+        )
+
+        data = json.loads(result)
+        assert data["success"] is True
+        assert "amountCriteria" not in mock_client.gql_call.call_args.kwargs["variables"]["input"]
+
+    @patch('monarch_mcp_server.tools.rules.get_monarch_client')
     async def test_create_rule_with_tags(self, mock_get_client):
         """Test creating a rule that adds tags."""
         mock_client = AsyncMock()
