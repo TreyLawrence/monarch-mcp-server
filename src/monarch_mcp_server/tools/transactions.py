@@ -22,6 +22,44 @@ from monarch_mcp_server.helpers import (
 
 logger = logging.getLogger(__name__)
 
+
+def _is_rate_limited(exc: BaseException) -> bool:
+    """Best-effort detection of an HTTP 429 / rate-limit error.
+
+    Monarch's API is undocumented and the upstream library surfaces HTTP
+    errors as several different exception types (gql transport errors,
+    aiohttp ClientResponseError, or plain exceptions), so we match
+    defensively on a numeric ``status``/``code`` attribute when present and
+    otherwise on the string form of the exception.
+    """
+    for attr in ("status", "code", "status_code"):
+        if getattr(exc, attr, None) == 429:
+            return True
+    text = str(exc).lower()
+    return "429" in text or "too many requests" in text or "rate limit" in text
+
+
+async def _retry_on_rate_limit(coro_factory, *, attempts: int = 3, base_delay: float = 1.0):
+    """Await ``coro_factory()``; on a 429, retry with exponential backoff.
+
+    ``coro_factory`` must return a fresh awaitable each call (a coroutine can
+    only be awaited once). Backoff is base_delay * 2**n (1s, 2s, 4s, ...).
+    Non-rate-limit errors propagate immediately; the final 429 re-raises.
+    """
+    for attempt in range(attempts):
+        try:
+            return await coro_factory()
+        except Exception as exc:  # noqa: BLE001 - re-raised below
+            if not _is_rate_limited(exc) or attempt == attempts - 1:
+                raise
+            delay = base_delay * (2 ** attempt)
+            logger.warning(
+                "Rate limited by Monarch (attempt %d/%d); backing off %.1fs",
+                attempt + 1, attempts, delay,
+            )
+            await asyncio.sleep(delay)
+
+
 KNOWN_CURRENCY_CODES = {
     "AED",
     "AUD",
@@ -676,6 +714,7 @@ async def update_transaction(
     date: Optional[str] = None,
     hide_from_reports: Optional[bool] = None,
     needs_review: Optional[bool] = None,
+    reviewed: Optional[bool] = None,
     notes: Optional[str] = None,
 ) -> str:
     """
@@ -690,6 +729,9 @@ async def update_transaction(
         date: New transaction date in YYYY-MM-DD format
         hide_from_reports: Whether to hide this transaction from reports
         needs_review: Whether this transaction needs review
+        reviewed: Set True to mark the transaction reviewed (sets
+            reviewStatus="reviewed"). To clear reviewed status, use
+            needs_review=True instead.
         notes: Notes for the transaction
     """
     try:
@@ -711,6 +753,8 @@ async def update_transaction(
             update_data["hide_from_reports"] = hide_from_reports
         if needs_review is not None:
             update_data["needs_review"] = needs_review
+        if reviewed is not None:
+            update_data["reviewed"] = reviewed
         if notes is not None:
             update_data["notes"] = notes
 
@@ -779,7 +823,7 @@ async def update_transaction_notes(
 @mcp.tool()
 async def mark_transaction_reviewed(transaction_id: str) -> str:
     """
-    Mark a transaction as reviewed (clears the needs_review flag).
+    Mark a transaction as reviewed (sets reviewStatus to "reviewed").
 
     Use this after reviewing a transaction that doesn't need category changes.
 
@@ -793,7 +837,7 @@ async def mark_transaction_reviewed(transaction_id: str) -> str:
         client = await get_monarch_client()
         result = await client.update_transaction(
             transaction_id=transaction_id,
-            needs_review=False,
+            reviewed=True,
         )
         return json_success(result)
     except Exception as e:
@@ -806,6 +850,7 @@ async def bulk_categorize_transactions(
     category_id: str,
     mark_reviewed: bool = True,
     dry_run: bool = False,
+    max_concurrency: int = 10,
 ) -> str:
     """
     Apply the same category to multiple transactions at once.
@@ -818,6 +863,11 @@ async def bulk_categorize_transactions(
         category_id: The category ID to apply to all transactions
         mark_reviewed: Whether to also mark transactions as reviewed (default: True)
         dry_run: If True, return what would be updated without making changes
+        max_concurrency: Maximum number of updates issued to Monarch at once
+            (default: 10). Bounds load on the API so large batches don't trip
+            rate limits or Cloudflare; updates are still applied to every id.
+            Individual updates that hit a 429 are retried with exponential
+            backoff (3 attempts, 1s/2s/4s) before being recorded as failed.
 
     Returns:
         Summary of results including success/failure counts. When dry_run is
@@ -831,6 +881,7 @@ async def bulk_categorize_transactions(
                 "transaction_ids": list(transaction_ids),
                 "category_id": category_id,
                 "mark_reviewed": mark_reviewed,
+                "max_concurrency": max(1, max_concurrency),
             })
 
         client = await get_monarch_client()
@@ -842,16 +893,27 @@ async def bulk_categorize_transactions(
             "errors": [],
         }
 
-        async def _update_one(txn_id: str) -> None:
-            update_params: Dict[str, Any] = {
-                "transaction_id": txn_id,
-                "category_id": category_id,
-            }
-            if mark_reviewed:
-                update_params["needs_review"] = False
-            await client.update_transaction(**update_params)
+        # Bound concurrency so large batches don't hammer Monarch's API
+        # (rate limits / Cloudflare). At least 1 to avoid a deadlocked
+        # semaphore if a caller passes 0 or a negative value.
+        semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
-        # Use asyncio.gather for concurrent updates
+        async def _update_one(txn_id: str) -> None:
+            async with semaphore:
+                update_params: Dict[str, Any] = {
+                    "transaction_id": txn_id,
+                    "category_id": category_id,
+                }
+                if mark_reviewed:
+                    update_params["reviewed"] = True
+                # Retry on 429 so a transient throttle doesn't permanently
+                # fail this transaction. update_transaction must be re-called
+                # (the coroutine can only be awaited once).
+                await _retry_on_rate_limit(
+                    lambda: client.update_transaction(**update_params)
+                )
+
+        # Use asyncio.gather for concurrent updates, capped by the semaphore
         tasks = [_update_one(txn_id) for txn_id in transaction_ids]
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
 

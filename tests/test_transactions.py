@@ -255,7 +255,7 @@ class TestMarkTransactionReviewed:
 
         call_kwargs = mock_client.update_transaction.call_args.kwargs
         assert call_kwargs["transaction_id"] == "txn_123"
-        assert call_kwargs["needs_review"] is False
+        assert call_kwargs["reviewed"] is True
 
         data = json.loads(result)
         assert "updateTransaction" in data
@@ -955,6 +955,7 @@ class TestUpdateTransaction:
             date="2026-04-01",
             hide_from_reports=True,
             needs_review=False,
+            reviewed=True,
             notes="All fields",
         )
         mock_monarch_client.update_transaction.assert_called_once_with(
@@ -966,6 +967,7 @@ class TestUpdateTransaction:
             date="2026-04-01",
             hide_from_reports=True,
             needs_review=False,
+            reviewed=True,
             notes="All fields",
         )
 
